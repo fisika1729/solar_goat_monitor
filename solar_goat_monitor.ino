@@ -16,12 +16,12 @@ void setup() {
   rfid_setup();
 
   // SIM module
-  sim_setup();
+  //sim_setup();
 }
 
 void loop() {
   rfid_loop();
-  sim_loop();
+  //sim_loop();
   // BLE is event-driven, nothing explicit required here
   delay(1);
 }

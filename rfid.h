@@ -4,50 +4,26 @@
 
 /*
    RFID + ADC + BUZZER module for ESP32-C3
-
-   Uses:
-   - Serial1 for UHF RFID reader
-   - GPIO3  for RFID power enable (RFID_POWER_PIN)
-   - GPIO2  for buzzer (BUZZER_PIN)
-   - GPIO0  for ADC (ADC_PIN)
 */
 
 // ===================== USER CONFIG =====================
 
-// UART pins for RFID
-#define RFID_RX_PIN        18   // ESP32-C3 RX from reader TX
-#define RFID_TX_PIN        19   // ESP32-C3 TX to reader RX
-
-// Power control pin (set to -1 if not used)
-#define RFID_POWER_PIN     3    // GPIO controlling reader VCC / EN
-
-// Buzzer pin (ACTIVE buzzer: HIGH = sound, LOW = off)
+#define RFID_RX_PIN        18
+#define RFID_TX_PIN        19
+#define RFID_POWER_PIN     3
 #define BUZZER_PIN         2
-
-// If your buzzer is wired to VCC and needs LOW to sound, set this to 0
 #define BUZZER_ACTIVE_HIGH 1
 
-// UART parameters for RFID
 #define RFID_BAUDRATE      115200
-
-// Heartbeat timeout for RFID reader
 #define HEARTBEAT_TIMEOUT_MS   3000
-
-// Max tags to keep in buffer
 #define MAX_TAGS           16
 
 // ===================== ADC CONFIG =====================
 
-// ADC pin (must be ADC-capable on ESP32-C3)
-#define ADC_PIN            0    // GPIO0
-
-// ADC characteristics
+#define ADC_PIN            0
 #define ADC_RES_BITS       12
 #define ADC_MAX_READING    ((1 << ADC_RES_BITS) - 1)
 #define ADC_VREF           3.3f
-
-// Voltage divider: Vin ---[R1]---+---[R2]--- GND, ADC at node +
-// You chose: R1 = 10k, R2 = 3k
 #define R1_VALUE           10000.0f
 #define R2_VALUE           3000.0f
 
@@ -70,7 +46,6 @@
 #define UHF_RESP_SUCCESS                    0x00
 #define UHF_RESP_INVENTORY_SUCCESS          0x01
 
-// Heartbeat switch params template
 static const uint8_t HEARTBEAT_SWITCH_PARAMS_TEMPLATE[7] = {
   0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00
 };
@@ -88,13 +63,14 @@ static size_t g_tagCount = 0;
 static unsigned long g_lastUartRxMs = 0;
 static unsigned long g_lastAdcPrintMs = 0;
 
+// NEW: flag so we beep only on first successful init
+static bool g_rfidInitializedOnce = false;
+
 // ===================== INTERNAL UTILS =====================
 
 static uint8_t rfid_calcChecksum(const uint8_t *data, size_t len) {
   uint8_t csum = 0;
-  for (size_t i = 0; i < len; ++i) {
-    csum ^= data[i];
-  }
+  for (size_t i = 0; i < len; ++i) csum ^= data[i];
   return csum;
 }
 
@@ -106,9 +82,7 @@ static bool rfid_readBytesWithTimeout(Stream &s, uint8_t *buf, size_t len, uint3
     if (s.available()) {
       buf[received++] = (uint8_t)s.read();
     } else {
-      if (millis() - start > timeoutMs) {
-        return false;
-      }
+      if (millis() - start > timeoutMs) return false;
       delay(1);
     }
   }
@@ -134,7 +108,7 @@ static void rfidPowerOff() {
 // ===================== ADC MEASUREMENT =====================
 
 static float rfid_readInputVoltage() {
-  int raw = analogRead(ADC_PIN);  // 0 .. 4095
+  int raw = analogRead(ADC_PIN);
   float vAdc = ((float)raw / (float)ADC_MAX_READING) * ADC_VREF;
   float vin = vAdc * ((R1_VALUE + R2_VALUE) / R2_VALUE);
   return vin;
@@ -175,9 +149,7 @@ static bool rfid_sendCommand(uint8_t cmd,
   frame[2] = (frameLen >> 8) & 0xFF;
   frame[3] = frameLen & 0xFF;
   frame[4] = cmd;
-  if (paramsLen && params) {
-    memcpy(&frame[5], params, paramsLen);
-  }
+  if (paramsLen && params) memcpy(&frame[5], params, paramsLen);
 
   uint8_t chk = rfid_calcChecksum(&frame[2], 2 + 1 + paramsLen);
   frame[5 + paramsLen] = chk;
@@ -308,9 +280,9 @@ static bool rfid_resetReader() {
 static bool rfid_setPowerMax() {
   Serial.println(F("[RFID] Setting power levels..."));
   const uint8_t powerLevels[][3] = {
-    {0x01, 0x1E, 0x1E}, // 30 dBm
-    {0x01, 0x1A, 0x1A}, // 26 dBm
-    {0x01, 0x14, 0x14}, // 20 dBm
+    {0x01, 0x1E, 0x1E},
+    {0x01, 0x1A, 0x1A},
+    {0x01, 0x14, 0x14},
   };
 
   uint8_t resp[32];
@@ -426,15 +398,10 @@ static bool rfid_startInventory(uint16_t count) {
 // ===================== TAG PARSING =====================
 
 static void rfid_addTagIfNew(const UhfTag &tag) {
-  if (g_tagCount > 0 && g_tags[g_tagCount - 1].epc == tag.epc) {
-    return;
-  }
+  if (g_tagCount > 0 && g_tags[g_tagCount - 1].epc == tag.epc) return;
 
-  if (g_tagCount < MAX_TAGS) {
-    g_tags[g_tagCount++] = tag;
-  } else {
-    g_tags[g_tagCount - 1] = tag;
-  }
+  if (g_tagCount < MAX_TAGS) g_tags[g_tagCount++] = tag;
+  else g_tags[g_tagCount - 1] = tag;
 
   Serial.print(F("[TAG] EPC="));
   Serial.print(tag.epc);
@@ -443,13 +410,12 @@ static void rfid_addTagIfNew(const UhfTag &tag) {
   Serial.print(F(" dBm ANT="));
   Serial.println(tag.antenna);
 
-  // Also push the tag info over BLE "BT serial"
   String tagMsg = "[TAG] EPC=" + tag.epc +
                   " RSSI=-" + String(tag.rssiDbm, 3) +
                   " dBm ANT=" + String(tag.antenna);
   bleDebugPrintLn(tagMsg);
 
-  // Beep ~500 ms for each new tag
+  // Beep for every *new* tag
   buzzerBeep(500);
 }
 
@@ -460,9 +426,8 @@ static void rfid_processContinuousInventoryResponse(const uint8_t *resp, size_t 
   if (epcLen == 0) return;
   if (respLen < (size_t)(2 + epcLen)) return;
 
-  // Optional EPC prefix filter (52 54); comment out if not needed
   if (!(resp[3] == 0x52 && resp[4] == 0x54)) {
-    // return;
+    // return; // prefix filter, left disabled
   }
 
   const uint8_t *epcPtr = &resp[3];
@@ -503,9 +468,7 @@ static void rfid_readTagsLoop() {
   while (Serial1.available() >= 4) {
     uint8_t header[4];
 
-    if (!rfid_readBytesWithTimeout(Serial1, header, 4, 10)) {
-      return;
-    }
+    if (!rfid_readBytesWithTimeout(Serial1, header, 4, 10)) return;
 
     if (header[0] != 0xA5 || header[1] != 0x5A) {
       Serial.print(F("[RFID] Bad header in loop: "));
@@ -593,7 +556,12 @@ inline void rfid_setup() {
     Serial.println(F("[RFID] Failed to start inventory"));
   } else {
     Serial.println(F("[RFID] Inventory started, reader initialized"));
-    buzzerBeep(1000);
+
+    // NEW: beep ONLY the very first time reader is initialized
+    if (!g_rfidInitializedOnce) {
+      g_rfidInitializedOnce = true;
+      buzzerBeep(1000);
+    }
   }
 
   g_lastUartRxMs = millis();
@@ -603,6 +571,7 @@ inline void rfid_setup() {
 inline void rfid_loop() {
   rfid_readTagsLoop();
 
+  // Heartbeat timeout: re-init WITHOUT beep now
   if (millis() - g_lastUartRxMs > HEARTBEAT_TIMEOUT_MS) {
     Serial.println(F("[RFID] Heartbeat timeout!"));
     g_lastUartRxMs = millis();
@@ -617,7 +586,7 @@ inline void rfid_loop() {
     rfid_setPowerMax();
     if (rfid_startInventory(1000)) {
       Serial.println(F("[RFID] Re-init OK, inventory restarted"));
-      buzzerBeep(1000);
+      // NOTE: NO buzzer here (only first init + per-tag)
     } else {
       Serial.println(F("[RFID] Re-init failed: cannot start inventory"));
     }
